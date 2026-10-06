@@ -1,0 +1,106 @@
+name: Publish reviewed toolchain images
+
+# Disabled until the owner configures the protected environment and package access.
+# See PUBLICATION.md for the generic release contract.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toolchain-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main' && vars.TOOLCHAIN_PUBLICATION_ENABLED == 'true'
+    environment: toolchain-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: python
+            base: python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+          - kind: node
+            base: node:24.20.0-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Choose repository-owned image name
+        id: names
+        env:
+          REPOSITORY: ${{ github.repository }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${REPOSITORY,,}-gate-${KIND}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          mkdir -p evidence
+      - name: Build once and push staging index
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: infra/toolchain-images
+          file: infra/toolchain-images/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BASE=${{ matrix.base }}
+            PERL_VERSION=5.36.0-7+deb12u4
+          tags: ${{ steps.names.outputs.image }}:staging-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+      - name: Verify and scan the exact registry platform manifests
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          INDEX: ${{ steps.build.outputs.digest }}
+          BASE: ${{ matrix.base }}
+          KIND: ${{ matrix.kind }}
+        run: ./scripts/verify-toolchain-image.sh
+      - name: Attest scanned index
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+        with:
+          subject-name: ${{ steps.names.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Promote scanned index without rebuilding
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          INDEX: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          tag="release-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          # Single source index: imagetools copies its existing descriptor graph.
+          docker buildx imagetools create --tag "$IMAGE:$tag" "$IMAGE@$INDEX"
+          actual=$(docker buildx imagetools inspect "$IMAGE:$tag" --format '{{.Manifest.Digest}}')
+          test "$actual" = "$INDEX"
+          printf '%s@%s\n' "$IMAGE" "$INDEX" | tee evidence/released-reference.txt
+          printf '### %s\n\nReleased `%s@%s`\n\nEvidence: %s/actions/runs/%s\n' \
+            '${{ matrix.kind }}' "$IMAGE" "$INDEX" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain scan and runtime evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: toolchain-${{ matrix.kind }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 90
