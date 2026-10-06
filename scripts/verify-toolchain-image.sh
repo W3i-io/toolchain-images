@@ -5,7 +5,8 @@ set -euo pipefail
 [[ "$INDEX" =~ ^sha256:[a-f0-9]{64}$ ]]
 [[ "$KIND" == python || "$KIND" == node ]]
 TRIVY='aquasec/trivy:0.69.1@sha256:1c78ed1ef824ab8bb05b04359d186e4c1229d0b3e67005faacb54a7d71974f73'
-mkdir -p evidence
+mkdir -p evidence .trivy-cache
+trap 'rm -f evidence/*-image.tar' EXIT
 printf '%s\n' "$IMAGE@$INDEX" "$BASE" > evidence/sources.txt
 docker buildx imagetools inspect "$IMAGE@$INDEX" --raw > evidence/index.json
 # BuildKit includes unknown/unknown attestation manifests: preserve these in the
@@ -36,12 +37,21 @@ for arch in amd64 arm64; do
     docker run --rm --platform "linux/$arch" "$ref" node --version > "evidence/$arch-runtime.txt"
     test "$(cat "evidence/$arch-runtime.txt")" = 'v24.20.0'
   fi
-  # Images have already been pulled by login-action's authenticated Docker client.
-  # Trivy scans that exact local digest via the socket: no token/env/file injection.
-  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-    -v "$PWD/evidence:/evidence" "$TRIVY" image --image-src docker \
+  # Export only the exact image; the scanner receives neither the Docker socket
+  # nor registry credentials. Cache and evidence contain public upstream data.
+  docker save "$ref" -o "evidence/$arch-image.tar"
+  docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
+    --security-opt no-new-privileges \
+    -v "$PWD/evidence:/evidence" -v "$PWD/.trivy-cache:/cache" \
+    "$TRIVY" image --input "/evidence/$arch-image.tar" \
+    --cache-dir /cache --skip-version-check \
     --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL --exit-code 0 \
-    --format json --output "/evidence/$arch-scan.json" "$ref"
+    --format json --output "/evidence/$arch-scan.json"
+  rm -f "evidence/$arch-image.tar"
+  docker run --rm --user "$(id -u):$(id -g)" --cap-drop ALL \
+    --security-opt no-new-privileges --network none \
+    -v "$PWD/.trivy-cache:/cache:ro" "$TRIVY" --cache-dir /cache \
+    --version > "evidence/$arch-scanner-version.txt"
   # Enforce policy against the saved report, not a second scan/DB snapshot.
   python3 - "$arch" <<'PY'
 import json, sys
